@@ -3,165 +3,126 @@ import socket
 import time
 import json
 import machine
-import os
 from max6675 import MAX6675
 
 # 1. HARDWARE SETUP
-print("--- SYSTEM STARTUP ---")
-led = machine.Pin(2, machine.Pin.OUT) 
+print("--- FURNACE SYSTEM STARTUP ---")
 ssr = machine.Pin(4, machine.Pin.OUT) 
-ssr.value(0) 
+ssr.value(1) # Relay OFF (Active Low)
 
 # Thermocouple (MAX6675) Pins
-sck = 5
-cs = 23
-so = 19
-print(f"Initializing MAX6675 (SCK:{sck}, CS:{cs}, SO:{so})...")
+sck = 5; cs = 23; so = 19
 sensor = MAX6675(sck, cs, so)
 
-# 2. MONITOR STATE
+# 2. STATE & PID PARAMETERS
 state = {
-    "temp": 0.0,
-    "status": "Starting",
+    "temp": 0.0, 
+    "setpoint": 150.0, 
+    "status": "Operational", 
+    "output_pct": 0.0,
+    "manual_mode": True,
     "uptime": 0
 }
 
-last_read = 0
+kp = 2.0; ki = 0.1; kd = 0.5
+integral = 0.0; last_error = 0.0; last_time = time.ticks_ms()
+cycle_start = time.ticks_ms()
+cycle_ms = 10000 
 
-def update_sensor():
-    global last_read
-    if time.ticks_diff(time.ticks_ms(), last_read) > 2000:
-        try:
-            current_temp = sensor.read_temp()
-            if current_temp is not None:
-                state["temp"] = current_temp
-                state["status"] = "Operational"
-                print(f"[{state['uptime']}s] Temp: {current_temp:.1f}C")
-            else:
-                state["status"] = "Sensor Error"
-                print(f"[{state['uptime']}s] ERROR: Thermocouple Disconnected")
-        except Exception as e:
-            print(f"Sensor Read Failed: {e}")
-            state["status"] = "Read Failed"
-            
-        state["uptime"] = time.ticks_ms() // 1000
-        last_read = time.ticks_ms()
+def run_control_cycle():
+    global integral, last_error, last_time, cycle_start
+    now = time.ticks_ms()
+    
+    # A. PID UPDATE (Every 2 seconds)
+    dt = time.ticks_diff(now, last_time) / 1000.0
+    if dt >= 2.0:
+        last_time = now
+        current_temp = sensor.read_temp()
+        if current_temp is None:
+            state["status"] = "Sensor Error"; ssr.value(1); return
+        
+        state["temp"] = current_temp
+        state["status"] = "Operational"
+        state["uptime"] = now // 1000
+        
+        if not state["manual_mode"]:
+            error = state["setpoint"] - current_temp
+            p_out = kp * error
+            if 0 < state["output_pct"] < 100: integral += error * dt
+            i_out = ki * integral
+            d_out = kd * (error - last_error) / dt
+            last_error = error
+            state["output_pct"] = max(0, min(100, p_out + i_out + d_out))
+        
+        mode_str = "MAN" if state["manual_mode"] else "PID"
+        print("UP:{}s | MD:{} | T:{}C | PWR:{}%".format(state['uptime'], mode_str, int(current_temp), int(state['output_pct'])))
+
+    # B. NON-BLOCKING RELAY CONTROL
+    # Calculate where we are in the 10-second cycle
+    ms_into_cycle = time.ticks_diff(now, cycle_start)
+    if ms_into_cycle >= cycle_ms:
+        cycle_start = now
+        ms_into_cycle = 0
+        
+    on_ms = int((state["output_pct"] / 100.0) * cycle_ms)
+    
+    if ms_into_cycle < on_ms:
+        ssr.value(0) # Relay ON (Active Low)
+    else:
+        ssr.value(1) # Relay OFF (Active Low)
 
 # 3. SETUP ACCESS POINT
-print("Starting WiFi Access Point...")
 ap = network.WLAN(network.AP_IF)
 ap.active(False); time.sleep(1)
-ap.config(essid='ESP32-Furnace-Monitor', password='password123')
+ap.config(essid='ESP32-Furnace-Control', password='password123')
 ap.active(True)
 
-while not ap.active():
-    pass
-
-print(f"WiFi Active. SSID: {ap.config('essid')}")
-print(f"Gateway IP (Dashboard): {ap.ifconfig()[0]}")
-
-# 4. HTML UI
-def get_html():
-    return """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Furnace Monitor</title>
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <script src="/chart.js"></script>
-        <style>
-            body { font-family: sans-serif; background: #020617; color: white; text-align: center; padding: 10px; }
-            .card { background: #1e293b; padding: 20px; border-radius: 16px; max-width: 600px; margin: auto; border: 1px solid #334155; }
-            .temp { font-size: 3.5em; color: #38bdf8; font-weight: bold; margin: 10px 0; }
-            .status-tag { background: #334155; padding: 5px 12px; border-radius: 20px; font-size: 0.8em; }
-            canvas { background: #0f172a; margin-top: 20px; border-radius: 12px; padding: 10px; }
-        </style>
-    </head>
-    <body>
-        <div class="card">
-            <h2>🔥 Furnace Monitor</h2>
-            <div class="temp"><span id="t">--</span>&deg;C</div>
-            <div class="status-tag" id="st">Connecting...</div>
-            <canvas id="tempChart"></canvas>
-        </div>
-        <script>
-            let chart;
-            function initChart() {
-                const ctx = document.getElementById('tempChart').getContext('2d');
-                chart = new Chart(ctx, {
-                    type: 'line',
-                    data: { labels: [], datasets: [{ label: 'Temperature', data: [], borderColor: '#38bdf8', backgroundColor: 'rgba(56, 189, 248, 0.1)', fill: true, tension: 0.4 }] },
-                    options: { 
-                        responsive: true,
-                        scales: { 
-                            y: { grid: { color: '#334155' }, ticks: { color: '#94a3b8' } },
-                            x: { display: false }
-                        },
-                        plugins: { legend: { display: false } }
-                    }
-                });
-            }
-
-            // Check if Chart.js is loaded
-            if (typeof Chart === 'undefined') {
-                document.getElementById('st').innerText = "Chart.js Load Error";
-            } else {
-                initChart();
-            }
-
-            setInterval(() => {
-                fetch('/data').then(r => r.json()).then(d => {
-                    document.getElementById('t').innerText = d.temp.toFixed(1);
-                    document.getElementById('st').innerText = d.status + " | Uptime: " + d.uptime + "s";
-                    if (chart) {
-                        chart.data.labels.push("");
-                        chart.data.datasets[0].data.push(d.temp);
-                        if(chart.data.labels.length > 50) { chart.data.labels.shift(); chart.data.datasets[0].data.shift(); }
-                        chart.update('none');
-                    }
-                }).catch(e => {
-                    document.getElementById('st').innerText = "Data Fetch Error";
-                });
-            }, 2000);
-        </script>
-    </body>
-    </html>
-    """
-
-# 5. WEB SERVER
-print("Starting Web Server on Port 80...")
+# 4. WEB SERVER
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-try: 
-    s.bind(('', 80))
-    s.listen(5)
-    s.setblocking(False)
-    print("Server successfully bound to Port 80.")
-except OSError as e:
-    print(f"Failed to bind Port 80: {e}. Resetting...")
-    machine.reset()
+try: s.bind(('', 80)); s.listen(5); s.setblocking(False)
+except OSError: machine.reset()
 
 print("--- SYSTEM READY ---")
 while True:
-    update_sensor()
+    run_control_cycle()
     try:
         conn, addr = s.accept()
         request = conn.recv(1024).decode()
         
         if 'GET /data' in request:
             conn.send('HTTP/1.1 200 OK\nContent-Type: application/json\n\n' + json.dumps(state))
+        elif 'GET /set_target' in request:
+            try:
+                val = float(request.split('val=')[1].split(' ')[0])
+                state["setpoint"] = val
+                integral = 0
+            except: pass
+            conn.send('HTTP/1.1 200 OK\n\nOK')
+        elif 'GET /toggle_mode' in request:
+            state["manual_mode"] = not state["manual_mode"]
+            state["output_pct"] = 0
+            conn.send('HTTP/1.1 200 OK\n\nOK')
+        elif 'GET /set_power' in request:
+            try:
+                val = float(request.split('val=')[1].split(' ')[0])
+                state["output_pct"] = max(0, min(100, val))
+            except: pass
+            conn.send('HTTP/1.1 200 OK\n\nOK')
         elif 'GET /chart.js' in request:
-            print("Serving chart.js...")
-            conn.send('HTTP/1.1 200 OK\nContent-Type: application/javascript\n\n')
+            conn.send('HTTP/1.1 200 OK\nContent-Type: application/javascript\nCache-Control: public, max-age=31536000\n\n')
             with open('chart.js', 'rb') as f:
                 while True:
-                    chunk = f.read(1024)
+                    chunk = f.read(1024); 
                     if not chunk: break
                     conn.send(chunk)
         else:
-            conn.send('HTTP/1.1 200 OK\nContent-Type: text/html\n\n' + get_html())
+            conn.send('HTTP/1.1 200 OK\nContent-Type: text/html\n\n')
+            with open('index.html', 'rb') as f:
+                while True:
+                    chunk = f.read(1024); 
+                    if not chunk: break
+                    conn.send(chunk)
         conn.close()
-    except OSError: 
-        pass 
-    except Exception as e:
-        print(f"Server Error: {e}")
+    except OSError: pass
+    except Exception as e: print(f"Server Error: {e}")

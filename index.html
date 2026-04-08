@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Furnace Control</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <script src="/chart.js"></script>
+    <style>
+        body { font-family: sans-serif; background: #020617; color: white; text-align: center; padding: 10px; }
+        .card { background: #1e293b; padding: 20px; border-radius: 16px; max-width: 600px; margin: auto; border: 1px solid #334155; }
+        .temp-display { font-size: 3.5em; color: #f43f5e; font-weight: bold; margin: 10px 0; }
+        .control-group { background: #0f172a; padding: 15px; border-radius: 12px; margin-top: 15px; display: flex; flex-direction: column; gap: 10px; }
+        .pct { color: #38bdf8; font-weight: bold; font-size: 1.2em; }
+        input[type=number], input[type=range] { width: 100%; padding: 10px; border-radius: 8px; border: 1px solid #334155; background: #1e293b; color: white; }
+        button { background: #334155; color: white; border: 1px solid #475569; padding: 10px; border-radius: 8px; cursor: pointer; }
+        .active-mode { background: #38bdf8; color: #020617; border: none; font-weight: bold; }
+        canvas { background: #0f172a; margin-top: 20px; border-radius: 12px; padding: 10px; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h2>🔥 Furnace Control</h2>
+        <div class="temp-display"><span id="t">--</span>&deg;C</div>
+        
+        <div class="control-group">
+            <button id="mainToggle" onclick="togglePower()" style="font-size: 1.2em; padding: 15px;">START FURNACE</button>
+            <p>Status: <span id="runStatus">STOPPED</span></p>
+        </div>
+
+        <div class="control-group">
+            <p>Target: <span id="targetVal">--</span>&deg;C | Power: <span id="opVal" class="pct">--</span>%</p>
+            <input type="number" id="tempInput" placeholder="Set Target Temp (°C)">
+            <button onclick="setTarget()">UPDATE TARGET</button>
+        </div>
+
+        <div class="control-group">
+            <button id="modeBtn" onclick="toggleMode()">Switch to PID Control</button>
+            <div id="manualControls">
+                <p>Manual Power Slider</p>
+                <input type="range" id="opSlider" min="0" max="100" value="0" onchange="setPower(this.value)">
+            </div>
+        </div>
+        
+        <canvas id="tempChart"></canvas>
+    </div>
+    <script>
+        let chart;
+        const ctx = document.getElementById('tempChart').getContext('2d');
+        chart = new Chart(ctx, {
+            type: 'line',
+            data: { labels: [], datasets: [{ label: 'Temp', data: [], borderColor: '#f43f5e', fill: false, tension: 0.4 }] },
+            options: { scales: { y: { min: 20, max: 200, grid: { color: '#334155' } }, x: { display: false } } }
+        });
+
+        function toggleMode() { fetch('/toggle_mode').then(() => location.reload()); }
+        function setPower(val) { fetch('/set_power?val=' + val); }
+        function setTarget() {
+            const val = document.getElementById('tempInput').value;
+            if(val) fetch('/set_target?val=' + val);
+        }
+
+        function togglePower() {
+            fetch('/toggle_power').then(() => {
+                // Wait a bit for the backend to update state
+                setTimeout(() => location.reload(), 100);
+            });
+        }
+
+        setInterval(() => {
+            fetch('/data').then(r => r.json()).then(d => {
+                document.getElementById('t').innerText = d.temp.toFixed(1);
+                document.getElementById('targetVal').innerText = d.setpoint;
+                document.getElementById('opVal').innerText = d.output_pct.toFixed(0);
+                
+                // Update Main Toggle Button
+                const btn = document.getElementById('mainToggle');
+                const status = document.getElementById('runStatus');
+                if (d.is_running) {
+                    btn.innerText = "STOP FURNACE";
+                    btn.style.background = "#ef4444"; // Red
+                    status.innerText = "RUNNING (" + (d.manual_mode ? "Manual" : "PID") + ")";
+                    status.style.color = "#10b981";
+                } else {
+                    btn.innerText = "START FURNACE";
+                    btn.style.background = "#10b981"; // Green
+                    status.innerText = "STOPPED";
+                    status.style.color = "#ef4444";
+                }
+
+                document.getElementById('modeBtn').innerText = d.manual_mode ? "Switch to PID" : "Switch to Manual";
+                document.getElementById('modeBtn').className = d.manual_mode ? "" : "active-mode";
+                document.getElementById('manualControls').style.display = d.manual_mode ? "block" : "none";
+                
+                chart.data.labels.push("");
+                chart.data.datasets[0].data.push(d.temp);
+                if(chart.data.labels.length > 50) { chart.data.labels.shift(); chart.data.datasets[0].data.shift(); }
+                chart.update('none');
+            });
+        }, 2000);
+    </script>
+</body>
+</html>
